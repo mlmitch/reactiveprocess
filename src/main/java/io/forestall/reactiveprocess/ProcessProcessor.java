@@ -7,7 +7,6 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Flow;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ProcessProcessor<S extends InputStream, T>
         implements Flow.Processor<ProcessInput<S, T>, ProcessOutput<BufferedInputStream, T>> {
@@ -16,8 +15,6 @@ public class ProcessProcessor<S extends InputStream, T>
 
     private final ProcessBuilder processBuilder;
     private final int maxProcesses;
-
-    private final AtomicBoolean destroy;
 
     public ProcessProcessor(List<String> arguments, int maxProcesses, long bufferSize) {
         if (maxProcesses <= 0) {
@@ -34,8 +31,6 @@ public class ProcessProcessor<S extends InputStream, T>
         processBuilder = new ProcessBuilder(new ArrayList<>(arguments));
 
         processSubscriber = new ProcessSubscriber<>(bufferSize);
-
-        destroy = new AtomicBoolean(false);
     }
 
     /**
@@ -43,8 +38,11 @@ public class ProcessProcessor<S extends InputStream, T>
      * Ensures future
      */
     public void destroy() {
-        destroy.set(true);
-        processSubscriber.cancelSubscription();
+        //stop incoming things
+        processSubscriber.destroy();
+
+        //TODO: initiate draining of everything and
+        //end outgoing subscriptions when done.
     }
 
     @Override
