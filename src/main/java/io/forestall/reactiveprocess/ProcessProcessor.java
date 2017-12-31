@@ -3,24 +3,26 @@ package io.forestall.reactiveprocess;
 import io.forestall.reactiveprocess.internals.ProcessPublisher;
 import io.forestall.reactiveprocess.internals.ProcessSubscriber;
 
+import java.io.BufferedInputStream;
 import java.io.InputStream;
 import java.util.List;
 import java.util.concurrent.Flow;
 
-public class ProcessProcessor implements Flow.Processor<InputStream, ProcessResult> {
+public class ProcessProcessor<S extends InputStream, T>
+        implements Flow.Processor<ProcessInput<S, T>, ProcessOutput<BufferedInputStream, T>> {
 
-    private final ProcessSubscriber processSubscriber;
-    private final ProcessPublisher processPublisher;
+    private final ProcessSubscriber<S, T> processSubscriber;
+    private final ProcessPublisher<BufferedInputStream, T> processPublisher;
 
     //TODO: maintain some sort of shutdown state where we reject future subscriptions?
 
     public ProcessProcessor(List<String> arguments, int maxProcesses) {
-        processSubscriber = new ProcessSubscriber();
-        processPublisher = new ProcessPublisher();
+        processSubscriber = new ProcessSubscriber<>();
+        processPublisher = new ProcessPublisher<>();
     }
 
     @Override
-    public void subscribe(Flow.Subscriber<? super ProcessResult> subscriber) {
+    public void subscribe(Flow.Subscriber<? super ProcessOutput<BufferedInputStream, T>> subscriber) {
         processPublisher.subscribe(subscriber);
     }
 
@@ -30,7 +32,7 @@ public class ProcessProcessor implements Flow.Processor<InputStream, ProcessResu
     }
 
     @Override
-    public void onNext(InputStream item) {
+    public void onNext(ProcessInput<S, T> item) {
         processSubscriber.onNext(item);
     }
 

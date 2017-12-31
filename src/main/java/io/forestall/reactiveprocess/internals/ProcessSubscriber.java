@@ -1,34 +1,56 @@
 package io.forestall.reactiveprocess.internals;
 
+import io.forestall.reactiveprocess.ProcessInput;
+
 import java.io.InputStream;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Flow;
+import java.util.concurrent.atomic.AtomicLong;
 
-public class ProcessSubscriber implements Flow.Subscriber<InputStream> {
+public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscriber<ProcessInput<S, T>> {
 
     private final ExecutorService subscriptionExecutor;
 
     private Flow.Subscription subscription;
     private long outstandingRequests;
 
-    private final ConcurrentLinkedQueue<InputStream> input;
+    /**
+     * This queue can balloon if subscription churn happens and past publishers
+     * keep calling onNext.
+     */
+    private final ConcurrentLinkedQueue<ProcessInput<S, T>> input;
+    private final AtomicLong inputSize;
 
-    private static final long BUFFER_SIZE = 2 * Flow.defaultBufferSize();
-    private static final long REQUEST_THRESHOLD = Flow.defaultBufferSize();
+    private final long bufferSize;
+    private final long requestThreshold;
 
-    public ProcessSubscriber() {
+    public ProcessSubscriber(long bufferSize) {
+        if (bufferSize <= 0) {
+            throw new IllegalArgumentException("bufferSize must be greater than 0");
+        }
+
         subscriptionExecutor = Executors.newSingleThreadExecutor();
         subscription = null;
         outstandingRequests = 0;
 
         input = new ConcurrentLinkedQueue<>();
+        inputSize = new AtomicLong(0);
+
+        this.bufferSize = bufferSize;
+        this.requestThreshold = bufferSize - (bufferSize / 2); //prevents from being 0
     }
 
-    public Optional<InputStream> get() {
-        return Optional.ofNullable(input.poll());
+    public Optional<ProcessInput<S, T>> get() {
+        Optional<ProcessInput<S, T>> result = Optional.ofNullable(input.poll());
+
+        if (result.isPresent()) {
+            inputSize.decrementAndGet();
+        }
+
+        return result;
     }
 
     public void cancelSubscription() {
@@ -39,22 +61,29 @@ public class ProcessSubscriber implements Flow.Subscriber<InputStream> {
     }
 
     @Override
-    public void onNext(InputStream item) {
+    public void onNext(ProcessInput<S, T> item) {
         if (null == item) {
             throw new NullPointerException("Null InputStreams not allowed.");
         }
 
-        //book keep and request more if warranted
-        subscriptionExecutor.submit(() -> {
-            outstandingRequests--;
-            if (outstandingRequests < REQUEST_THRESHOLD && null != subscription) {
-                subscription.request(BUFFER_SIZE - outstandingRequests);
-                outstandingRequests = BUFFER_SIZE;
-            }
-        });
-
         //always true for this type of queue
         input.add(item);
+
+        //book keeping
+        subscriptionExecutor.submit(() -> {
+            outstandingRequests--;
+            long localInputSize = inputSize.incrementAndGet();
+
+            //don't strictly enforce input size
+            //just make sure the queue being consumed.
+            if (outstandingRequests < requestThreshold
+                    && localInputSize < bufferSize
+                    && null != subscription) {
+
+                subscription.request(bufferSize - outstandingRequests);
+                outstandingRequests = bufferSize;
+            }
+        });
     }
 
     @Override
@@ -66,8 +95,7 @@ public class ProcessSubscriber implements Flow.Subscriber<InputStream> {
         subscriptionExecutor.submit(() -> {
             if (null == this.subscription) {
                 this.subscription = subscription;
-                this.subscription.request(BUFFER_SIZE);
-                outstandingRequests = BUFFER_SIZE;
+                outstandingRequests = 0;
             } else {
                 subscription.cancel();
             }
@@ -95,5 +123,4 @@ public class ProcessSubscriber implements Flow.Subscriber<InputStream> {
             subscription = null;
         });
     }
-
 }
