@@ -10,6 +10,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Flow;
 import java.util.concurrent.atomic.AtomicLong;
 
+
+/**
+ * No blocking on Subscriber interface methods.
+ *
+ * @param <S>
+ * @param <T>
+ */
 public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscriber<ProcessInput<S, T>> {
 
     private final ExecutorService subscriptionExecutor;
@@ -55,8 +62,10 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
 
     public void cancelSubscription() {
         subscriptionExecutor.submit(() -> {
-            subscription.cancel();
-            subscription = null;
+            if (null != subscription) {
+                subscription.cancel();
+                subscription = null;
+            }
         });
     }
 
@@ -111,6 +120,7 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
         //Outstanding requests will be reset when
         //another subscriber is provided
         subscriptionExecutor.submit(() -> {
+            //if (null != subscription)
             subscription = null;
         });
     }
@@ -120,6 +130,7 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
         //Outstanding requests will be reset when
         //another subscriber is provided
         subscriptionExecutor.submit(() -> {
+            //if (null != subscription)
             subscription = null;
         });
     }
