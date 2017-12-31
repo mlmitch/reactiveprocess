@@ -1,5 +1,5 @@
 package io.forestall.reactiveprocess;
 
-public class ProcessDispatcherTest {
+public class ProcessProcessorTest {
 
 }

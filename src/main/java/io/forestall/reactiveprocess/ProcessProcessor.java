@@ -1,29 +1,55 @@
 package io.forestall.reactiveprocess;
 
-import io.forestall.reactiveprocess.internals.ProcessPublisher;
 import io.forestall.reactiveprocess.internals.ProcessSubscriber;
 
 import java.io.BufferedInputStream;
 import java.io.InputStream;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Flow;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ProcessProcessor<S extends InputStream, T>
         implements Flow.Processor<ProcessInput<S, T>, ProcessOutput<BufferedInputStream, T>> {
 
     private final ProcessSubscriber<S, T> processSubscriber;
-    private final ProcessPublisher<BufferedInputStream, T> processPublisher;
 
-    //TODO: maintain some sort of shutdown state where we reject future subscriptions?
+    private final ProcessBuilder processBuilder;
+    private final int maxProcesses;
 
-    public ProcessProcessor(List<String> arguments, int maxProcesses) {
-        processSubscriber = new ProcessSubscriber<>();
-        processPublisher = new ProcessPublisher<>();
+    private final AtomicBoolean destroy;
+
+    public ProcessProcessor(List<String> arguments, int maxProcesses, long bufferSize) {
+        if (maxProcesses <= 0) {
+            throw new IllegalArgumentException("Maximum number of processes must be greater than 0");
+        }
+
+        if (null == arguments || arguments.isEmpty()) {
+            throw new IllegalArgumentException("Null or empty argument lists are not allowed");
+        }
+
+        this.maxProcesses = maxProcesses;
+
+        //copy the list so changes to the input don't happen in here
+        processBuilder = new ProcessBuilder(new ArrayList<>(arguments));
+
+        processSubscriber = new ProcessSubscriber<>(bufferSize);
+
+        destroy = new AtomicBoolean(false);
+    }
+
+    /**
+     * Cancels the incoming subscription.
+     * Ensures future
+     */
+    public void destroy() {
+        destroy.set(true);
+        processSubscriber.cancelSubscription();
     }
 
     @Override
     public void subscribe(Flow.Subscriber<? super ProcessOutput<BufferedInputStream, T>> subscriber) {
-        processPublisher.subscribe(subscriber);
+
     }
 
     @Override

@@ -10,6 +10,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Flow;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static java.lang.Long.min;
+
 
 /**
  * No blocking on Subscriber interface methods.
@@ -23,50 +25,58 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
 
     private Flow.Subscription subscription;
     private long outstandingRequests;
+    private boolean destroyCalled;
 
-    /**
-     * This queue can balloon if subscription churn happens and past publishers
-     * keep calling onNext.
-     */
     private final ConcurrentLinkedQueue<ProcessInput<S, T>> input;
+    //keep our own input size as ConcurrentLinkedQueue::size is O(n) and not accurate
     private final AtomicLong inputSize;
 
-    private final long bufferSize;
+    private final long maxRequests;
     private final long requestThreshold;
 
-    public ProcessSubscriber(long bufferSize) {
-        if (bufferSize <= 0) {
-            throw new IllegalArgumentException("bufferSize must be greater than 0");
+    public ProcessSubscriber(long maxRequests) {
+        if (maxRequests <= 0) {
+            throw new IllegalArgumentException("maxRequests must be greater than 0");
         }
 
         subscriptionExecutor = Executors.newSingleThreadExecutor();
         subscription = null;
         outstandingRequests = 0;
+        destroyCalled = false;
 
         input = new ConcurrentLinkedQueue<>();
         inputSize = new AtomicLong(0);
 
-        this.bufferSize = bufferSize;
-        this.requestThreshold = bufferSize - (bufferSize / 2); //prevents from being 0
+        this.maxRequests = maxRequests;
+        this.requestThreshold = maxRequests - (maxRequests / 2); //prevents from being 0
+    }
+
+    /**
+     * Cancels the current subscription and prevents future subscriptions.
+     */
+    public void destroy() {
+        subscriptionExecutor.submit(() -> {
+            if (null != subscription) {
+                subscription.cancel();
+                subscription = null;
+            }
+            destroyCalled = true;
+        });
     }
 
     public Optional<ProcessInput<S, T>> get() {
         Optional<ProcessInput<S, T>> result = Optional.ofNullable(input.poll());
 
         if (result.isPresent()) {
-            inputSize.decrementAndGet();
+            long localInputSize = inputSize.getAndDecrement();
+            if (localInputSize >= maxRequests) {
+                //the buffer could have been full when onNexts were called
+                //therefore we might need to request more here
+                subscriptionExecutor.submit(this::requestMore);
+            }
         }
 
         return result;
-    }
-
-    public void cancelSubscription() {
-        subscriptionExecutor.submit(() -> {
-            if (null != subscription) {
-                subscription.cancel();
-                subscription = null;
-            }
-        });
     }
 
     @Override
@@ -81,18 +91,22 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
         //book keeping
         subscriptionExecutor.submit(() -> {
             outstandingRequests--;
-            long localInputSize = inputSize.incrementAndGet();
-
-            //don't strictly enforce input size
-            //just make sure the queue being consumed.
-            if (outstandingRequests < requestThreshold
-                    && localInputSize < bufferSize
-                    && null != subscription) {
-
-                subscription.request(bufferSize - outstandingRequests);
-                outstandingRequests = bufferSize;
-            }
+            inputSize.incrementAndGet();
+            requestMore();
         });
+    }
+
+    private void requestMore() {
+        //don't strictly enforce input size
+        //just make sure the queue is being consumed.
+        if (outstandingRequests < requestThreshold
+                && inputSize.get() < maxRequests
+                && null != subscription) {
+            //if outstandingRequests goes negative due to previous
+            //publishers, we recover here.
+            subscription.request(min(maxRequests - outstandingRequests, maxRequests));
+            outstandingRequests = maxRequests;
+        }
     }
 
     @Override
@@ -102,7 +116,7 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
         }
 
         subscriptionExecutor.submit(() -> {
-            if (null == this.subscription) {
+            if (null == this.subscription && !destroyCalled) {
                 this.subscription = subscription;
                 outstandingRequests = 0;
             } else {
