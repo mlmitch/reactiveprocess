@@ -27,11 +27,11 @@ public class ProcessSubscriber implements Flow.Subscriber<InputStream> {
         input = new ConcurrentLinkedQueue<>();
     }
 
-    protected Optional<InputStream> get() {
+    public Optional<InputStream> get() {
         return Optional.ofNullable(input.poll());
     }
 
-    protected void cancelSubscription() {
+    public void cancelSubscription() {
         subscriptionExecutor.submit(() -> {
             subscription.cancel();
             subscription = null;
