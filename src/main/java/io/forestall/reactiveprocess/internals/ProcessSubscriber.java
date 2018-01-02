@@ -8,7 +8,6 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Flow;
-import java.util.concurrent.atomic.AtomicLong;
 
 import static java.lang.Long.min;
 
@@ -21,59 +20,76 @@ import static java.lang.Long.min;
  */
 public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscriber<ProcessInput<S, T>> {
 
+    private final Runnable push;
+
+    //provides thread safety on the subscription and other book keeping fields
     private final ExecutorService subscriptionExecutor;
 
     private Flow.Subscription subscription;
     private long outstandingRequests;
-    private boolean destroyCalled;
+    private boolean destroyed;
 
     private final ConcurrentLinkedQueue<ProcessInput<S, T>> input;
     //keep our own input size as ConcurrentLinkedQueue::size is O(n) and not accurate
-    private final AtomicLong inputSize;
+    private long inputSize;
 
     private final long maxRequests;
     private final long requestThreshold;
 
-    public ProcessSubscriber(long maxRequests) {
+    /**
+     * @param maxRequests maximum number of outstanding requests allowed
+     * @param push        non-blocking, thread-safe function to signal the availability of elements
+     */
+    public ProcessSubscriber(long maxRequests, Runnable push) {
         if (maxRequests <= 0) {
             throw new IllegalArgumentException("maxRequests must be greater than 0");
         }
 
+        this.push = push;
+
         subscriptionExecutor = Executors.newSingleThreadExecutor();
         subscription = null;
         outstandingRequests = 0;
-        destroyCalled = false;
+        destroyed = false;
 
         input = new ConcurrentLinkedQueue<>();
-        inputSize = new AtomicLong(0);
+        inputSize = 0;
 
         this.maxRequests = maxRequests;
         this.requestThreshold = maxRequests - (maxRequests / 2); //prevents from being 0
     }
 
-    /**
-     * Cancels the current subscription and prevents future subscriptions.
-     */
-    public void destroy() {
+    public void unsubscribe() {
         subscriptionExecutor.submit(() -> {
             if (null != subscription) {
                 subscription.cancel();
                 subscription = null;
             }
-            destroyCalled = true;
         });
     }
 
-    public Optional<ProcessInput<S, T>> get() {
+    /**
+     * Unsubscribe and prevent future subscriptions
+     */
+    public void destroy() {
+        subscriptionExecutor.submit(() -> {
+            destroyed = true;
+            if (null != subscription) {
+                subscription.cancel();
+                subscription = null;
+            }
+        });
+    }
+
+    public Optional<ProcessInput<S, T>> supply() {
         Optional<ProcessInput<S, T>> result = Optional.ofNullable(input.poll());
 
         if (result.isPresent()) {
-            long localInputSize = inputSize.getAndDecrement();
-            if (localInputSize >= maxRequests) {
-                //the buffer could have been full when onNexts were called
-                //therefore we might need to request more here
-                subscriptionExecutor.submit(this::requestMore);
-            }
+            //successfully got an element
+            subscriptionExecutor.submit(() -> {
+                inputSize--;
+                pull();
+            });
         }
 
         return result;
@@ -91,16 +107,20 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
         //book keeping
         subscriptionExecutor.submit(() -> {
             outstandingRequests--;
-            inputSize.incrementAndGet();
-            requestMore();
+            inputSize++;
+            pull();
         });
+
+        //signal that something has become available
+        push.run();
     }
 
-    private void requestMore() {
+    //only call from within subscription executor
+    private void pull() {
         //don't strictly enforce input size
         //just make sure the queue is being consumed.
         if (outstandingRequests < requestThreshold
-                && inputSize.get() < maxRequests
+                && inputSize < maxRequests
                 && null != subscription) {
             //if outstandingRequests goes negative due to previous
             //publishers, we recover here.
@@ -116,9 +136,10 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
         }
 
         subscriptionExecutor.submit(() -> {
-            if (null == this.subscription && !destroyCalled) {
+            if (null == this.subscription && !destroyed) {
                 this.subscription = subscription;
                 outstandingRequests = 0;
+                pull();
             } else {
                 subscription.cancel();
             }
@@ -130,6 +151,8 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
         if (null == throwable) {
             throw new NullPointerException("Null Throwables not allowed.");
         }
+
+        //TODO: consider propagating the error... doesn't seem to be a good reason to
 
         //Outstanding requests will be reset when
         //another subscriber is provided

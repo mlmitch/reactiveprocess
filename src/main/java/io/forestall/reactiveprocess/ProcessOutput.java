@@ -1,21 +1,21 @@
 package io.forestall.reactiveprocess;
 
-import java.io.InputStream;
+import java.io.BufferedInputStream;
 
-public class ProcessOutput<S extends InputStream, T> {
+public class ProcessOutput<T> {
 
-    private final S stdout;
-    private final S stderr;
+    private final BufferedInputStream stdout;
+    private final BufferedInputStream stderr;
 
     private final T tag;
 
-    public ProcessOutput(S stdout, S stderr, T tag) {
+    public ProcessOutput(BufferedInputStream stdout, BufferedInputStream stderr, T tag) {
         this.stdout = stdout;
         this.stderr = stderr;
         this.tag = tag;
     }
 
-    public S getStdout() {
+    public BufferedInputStream getStdout() {
         return stdout;
     }
 
@@ -23,7 +23,7 @@ public class ProcessOutput<S extends InputStream, T> {
         return tag;
     }
 
-    public S getStderr() {
+    public BufferedInputStream getStderr() {
         return stderr;
     }
 }
