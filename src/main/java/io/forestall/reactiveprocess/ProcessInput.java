@@ -2,18 +2,18 @@ package io.forestall.reactiveprocess;
 
 import java.io.InputStream;
 
-public class ProcessInput<S extends InputStream, T> {
+public class ProcessInput<T> {
 
-    private final S stdin;
+    private final InputStream stdin;
 
     private final T tag;
 
-    public ProcessInput(S stdin, T tag) {
+    public ProcessInput(InputStream stdin, T tag) {
         this.stdin = stdin;
         this.tag = tag;
     }
 
-    public S getStdin() {
+    public InputStream getStdin() {
         return stdin;
     }
 

@@ -2,11 +2,9 @@ package io.forestall.reactiveprocess.internals;
 
 import io.forestall.reactiveprocess.ProcessInput;
 
-import java.io.InputStream;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Flow;
 
 import static java.lang.Long.min;
@@ -15,21 +13,20 @@ import static java.lang.Long.min;
 /**
  * No blocking on Subscriber interface methods.
  *
- * @param <S>
  * @param <T>
  */
-public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscriber<ProcessInput<S, T>> {
+public class ProcessSubscriber<T> implements Flow.Subscriber<ProcessInput<T>> {
 
     private final Runnable push;
 
     //provides thread safety on the subscription and other book keeping fields
-    private final ExecutorService subscriptionExecutor;
+    private final ExecutorService executor;
 
     private Flow.Subscription subscription;
     private long outstandingRequests;
     private boolean destroyed;
 
-    private final ConcurrentLinkedQueue<ProcessInput<S, T>> input;
+    private final ConcurrentLinkedQueue<ProcessInput<T>> input;
     //keep our own input size as ConcurrentLinkedQueue::size is O(n) and not accurate
     private long inputSize;
 
@@ -38,16 +35,17 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
 
     /**
      * @param maxRequests maximum number of outstanding requests allowed
-     * @param push        non-blocking, thread-safe function to signal the availability of elements
+     * @param executor    ExecutorService for running push and other internal tasks
+     * @param push        function to signal the availability of elements
      */
-    public ProcessSubscriber(long maxRequests, Runnable push) {
+    public ProcessSubscriber(long maxRequests, ExecutorService executor, Runnable push) {
         if (maxRequests <= 0) {
             throw new IllegalArgumentException("maxRequests must be greater than 0");
         }
 
         this.push = push;
 
-        subscriptionExecutor = Executors.newSingleThreadExecutor();
+        this.executor = executor;
         subscription = null;
         outstandingRequests = 0;
         destroyed = false;
@@ -60,7 +58,7 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
     }
 
     public void unsubscribe() {
-        subscriptionExecutor.submit(() -> {
+        executor.submit(() -> {
             if (null != subscription) {
                 subscription.cancel();
                 subscription = null;
@@ -72,7 +70,7 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
      * Unsubscribe and prevent future subscriptions
      */
     public void destroy() {
-        subscriptionExecutor.submit(() -> {
+        executor.submit(() -> {
             destroyed = true;
             if (null != subscription) {
                 subscription.cancel();
@@ -81,12 +79,12 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
         });
     }
 
-    public Optional<ProcessInput<S, T>> supply() {
-        Optional<ProcessInput<S, T>> result = Optional.ofNullable(input.poll());
+    public Optional<ProcessInput<T>> supply() {
+        Optional<ProcessInput<T>> result = Optional.ofNullable(input.poll());
 
         if (result.isPresent()) {
             //successfully got an element
-            subscriptionExecutor.submit(() -> {
+            executor.submit(() -> {
                 inputSize--;
                 pull();
             });
@@ -96,7 +94,7 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
     }
 
     @Override
-    public void onNext(ProcessInput<S, T> item) {
+    public void onNext(ProcessInput<T> item) {
         if (null == item) {
             throw new NullPointerException("Null InputStreams not allowed.");
         }
@@ -105,14 +103,14 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
         input.add(item);
 
         //book keeping
-        subscriptionExecutor.submit(() -> {
+        executor.submit(() -> {
             outstandingRequests--;
             inputSize++;
             pull();
-        });
 
-        //signal that something has become available
-        push.run();
+            //signal that something has become available
+            push.run();
+        });
     }
 
     //only call from within subscription executor
@@ -135,7 +133,7 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
             throw new NullPointerException("Null Subscriptions not allowed.");
         }
 
-        subscriptionExecutor.submit(() -> {
+        executor.submit(() -> {
             if (null == this.subscription && !destroyed) {
                 this.subscription = subscription;
                 outstandingRequests = 0;
@@ -156,7 +154,8 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
 
         //Outstanding requests will be reset when
         //another subscriber is provided
-        subscriptionExecutor.submit(() -> {
+        //This needs to be submitted or subscription would need to be volatile
+        executor.submit(() -> {
             //if (null != subscription)
             subscription = null;
         });
@@ -166,7 +165,7 @@ public class ProcessSubscriber<S extends InputStream, T> implements Flow.Subscri
     public void onComplete() {
         //Outstanding requests will be reset when
         //another subscriber is provided
-        subscriptionExecutor.submit(() -> {
+        executor.submit(() -> {
             //if (null != subscription)
             subscription = null;
         });

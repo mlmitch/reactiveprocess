@@ -3,32 +3,32 @@ package io.forestall.reactiveprocess;
 import io.forestall.reactiveprocess.internals.ProcessSubscriber;
 import io.forestall.reactiveprocess.internals.ProcessSubscription;
 
-import java.io.BufferedOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.io.*;
 import java.util.Optional;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
 
-public class ProcessProcessor<S extends InputStream, T>
-        implements Flow.Processor<ProcessInput<S, T>, ProcessOutput<T>> {
+public class ProcessProcessor<T>
+        implements Flow.Processor<ProcessInput<T>, ProcessOutput<T>> {
 
-    private final ProcessSubscriber<S, T> processSubscriber;
+    private final ProcessSubscriber<T> processSubscriber;
     private final ConcurrentHashMap<Flow.Subscriber<? super ProcessOutput<T>>, ProcessSubscription<T>> subscriptions;
 
     private final ProcessBuilder processBuilder;
     private final int maxProcesses;
-    private final AtomicInteger runningProcesses;
+    private int runningProcesses;
 
     private final ConcurrentLinkedQueue<ProcessOutput<T>> output;
     private long outputSize;
+    private final long maxOutputSize;
 
-    private final ExecutorService processExecutor;
+    //single thread executor for bookeeping
+    private final ExecutorService executor;
+
+    private final long processTimeoutMillis;
 
     private final ExecutorService streamCopier;
 
-    public ProcessProcessor(ProcessBuilder processBuilder, int maxProcesses, long maxRequests) {
+    public ProcessProcessor(ProcessBuilder processBuilder, int maxProcesses, long maxRequests, long processTimeoutMillis) {
         if (maxProcesses <= 0) {
             throw new IllegalArgumentException("Maximum number of processes must be greater than 0");
         }
@@ -40,22 +40,26 @@ public class ProcessProcessor<S extends InputStream, T>
         this.processBuilder = processBuilder;
         this.maxProcesses = maxProcesses;
 
-        processSubscriber = new ProcessSubscriber<>(maxRequests, this::pull);
+        executor = Executors.newSingleThreadExecutor();
 
-        runningProcesses = new AtomicInteger(0);
+        processSubscriber = new ProcessSubscriber<>(maxRequests, executor, this::pull);
+
+        runningProcesses = 0;
+        this.processTimeoutMillis = processTimeoutMillis;
 
         subscriptions = new ConcurrentHashMap<>();
 
         output = new ConcurrentLinkedQueue<>();
         outputSize = 0;
+        maxOutputSize = maxRequests;
 
-        processExecutor = Executors.newSingleThreadExecutor();
         streamCopier = Executors.newWorkStealingPool(maxProcesses);
     }
 
     private void push() {
         //initiate pushes to all the subscriptions
-        //try to do it in a random order
+        //would be nice if we could do this in a random order
+        subscriptions.values().forEach(ProcessSubscription::push);
     }
 
     public void destroy() {
@@ -72,22 +76,21 @@ public class ProcessProcessor<S extends InputStream, T>
         subscriptions.values().forEach(s -> s.pushError(throwable));
     }
 
-    //
     private void pull() {
-        //called by the subscriber
-        //must be non blocking
-
+        //called by the subscriber on the executor
 
         //check if we want to make another process
         //max processes executing already
         //result queue can take more
+        if (runningProcesses < maxProcesses && outputSize < maxOutputSize) {
+            Optional<ProcessInput<T>> input = processSubscriber.supply();
+            input.ifPresent(this::launchProcess);
+        }
 
-
-        //retrieve some
     }
 
     //only call within processExecutor
-    private void launchProcess(ProcessInput<S, T> processInput) {
+    private void launchProcess(ProcessInput<T> processInput) {
         Process process;
 
         try {
@@ -97,6 +100,8 @@ public class ProcessProcessor<S extends InputStream, T>
             destroy(e);
             return;
         }
+
+        runningProcesses++;
 
         InputStream stdinIS = processInput.getStdin();
         //docs say this should be buffered
@@ -124,8 +129,32 @@ public class ProcessProcessor<S extends InputStream, T>
             }
         });
 
+        ProcessOutput<T> processOutput =
+                new ProcessOutput<>(process.toHandle(),
+                        new BufferedInputStream(process.getInputStream()),
+                        new BufferedInputStream(process.getErrorStream()),
+                        processInput.getTag());
 
-        //TODO: create ProcessOutput and queue it up
+        output.add(processOutput);
+        outputSize++;
+
+        process.toHandle()
+                .onExit()
+                .orTimeout(processTimeoutMillis, TimeUnit.MILLISECONDS)
+                .whenCompleteAsync((p, t) -> {
+                    if (p.isAlive()) {
+                        //this means we timed out
+                        //destroy instead of forciblyDestroy
+                        //to give the process some chance of cleaning
+                        p.destroy();
+                    }
+
+                    //if(null != t){
+                    //TODO: do something with this error. maybe a logging function.
+                    //}
+
+                }, executor);
+
         //TODO: set up actions to take when the process completes
     }
 
@@ -136,7 +165,7 @@ public class ProcessProcessor<S extends InputStream, T>
 
         if (result.isPresent()) {
             //successfully got an element
-            processExecutor.submit(() -> {
+            executor.submit(() -> {
                 outputSize--;
                 pull();
             });
@@ -159,7 +188,7 @@ public class ProcessProcessor<S extends InputStream, T>
         //goes against spec to create another
         //not mandated to notify the subscriber
         subscriptions.computeIfAbsent(subscriber, s -> {
-            ProcessSubscription<T> subscription = new ProcessSubscription<>(s, this::supply);
+            ProcessSubscription<T> subscription = new ProcessSubscription<>(s, executor, this::supply);
             s.onSubscribe(subscription);
             return subscription;
         });
@@ -176,7 +205,7 @@ public class ProcessProcessor<S extends InputStream, T>
     }
 
     @Override
-    public void onNext(ProcessInput<S, T> item) {
+    public void onNext(ProcessInput<T> item) {
         processSubscriber.onNext(item);
     }
 

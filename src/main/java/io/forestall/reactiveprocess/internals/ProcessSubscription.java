@@ -4,14 +4,13 @@ import io.forestall.reactiveprocess.ProcessOutput;
 
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Flow;
 import java.util.function.Supplier;
 
 public class ProcessSubscription<T> implements Flow.Subscription {
 
     private final Flow.Subscriber<? super ProcessOutput<T>> subscriber;
-    private final ExecutorService subscriberExecutor;
+    private final ExecutorService executor;
 
     private final Supplier<Optional<ProcessOutput<T>>> pull;
 
@@ -20,24 +19,25 @@ public class ProcessSubscription<T> implements Flow.Subscription {
 
     /**
      * @param subscriber the subscriber of this subscription
-     * @param pull       non-blocking method to possibly supply items when called
+     * @param executor   ExecutorService for running pull and other internal tasks
+     * @param pull       method to possibly supply items when called
      */
     public ProcessSubscription(Flow.Subscriber<? super ProcessOutput<T>> subscriber,
+                               ExecutorService executor,
                                Supplier<Optional<ProcessOutput<T>>> pull) {
 
         this.subscriber = subscriber;
         this.pull = pull;
-        this.subscriberExecutor = Executors.newSingleThreadExecutor();
+        this.executor = executor;
 
         requests = 0;
         active = true;
     }
 
-    //only call from subscriberExecutor
+    //only call executor
     private void pullAndSend() {
         //recursive function to deliver data to the subscriber
-        //won't stack overflow as the recursive call is dispatched on the
-        //subscriber executor
+        //won't stack overflow as the recursive call is dispatched on the executor
 
         if (requests > 0 && active) {
             Optional<ProcessOutput<T>> outputOptional = this.pull.get();
@@ -47,7 +47,7 @@ public class ProcessSubscription<T> implements Flow.Subscription {
 
                 //recursive call to supply and send again
                 //if this one was well received
-                subscriberExecutor.submit(this::pullAndSend);
+                executor.submit(this::pullAndSend);
             }
         }
     }
@@ -61,7 +61,7 @@ public class ProcessSubscription<T> implements Flow.Subscription {
     }
 
     public void pushComplete() {
-        subscriberExecutor.submit(() -> {
+        executor.submit(() -> {
             if (active) {
                 active = false;
                 subscriber.onComplete();
@@ -70,22 +70,27 @@ public class ProcessSubscription<T> implements Flow.Subscription {
     }
 
     public void pushError(Throwable throwable) {
-        subscriberExecutor.submit(() -> error(throwable));
+        executor.submit(() -> error(throwable));
     }
 
     public void push() {
-        subscriberExecutor.submit(this::pullAndSend);
+        executor.submit(this::pullAndSend);
     }
 
     //Only the subscriber should call this
     @Override
     public void request(long n) {
-        subscriberExecutor.submit(() -> {
-            if (n > 0) {
+        //make exception out here so the stack is useful
+        Optional<IllegalArgumentException> e = (n > 0) ?
+                Optional.empty() :
+                Optional.of(new IllegalArgumentException("Non positive request amount '" + n + "' is illegal"));
+
+        executor.submit(() -> {
+            if (e.isPresent()) {
+                error(e.get());
+            } else {
                 requests += n;
                 pullAndSend();
-            } else {
-                error(new IllegalArgumentException("Non positive requests are illegal"));
             }
         });
     }
@@ -93,6 +98,6 @@ public class ProcessSubscription<T> implements Flow.Subscription {
     //Only the subscriber should call this
     @Override
     public void cancel() {
-        subscriberExecutor.submit(() -> active = false);
+        executor.submit(() -> active = false);
     }
 }
