@@ -250,10 +250,9 @@ public class ProcessProcessor<T> implements Flow.Processor<ProcessInput<T>, Proc
     //only call within executor
     private void pushToSubscriptions() {
         //remove the inactive subscriptions
-        outgoingSubscriptions.values().stream()
-                .filter(s -> !s.isActive())
-                .map(ProcessSubscription::getSubscriber)
-                .forEach(outgoingSubscriptions::remove);
+        outgoingSubscriptions.entrySet().stream()
+                .filter(e -> !e.getValue().isActive())
+                .forEach(e -> outgoingSubscriptions.remove(e.getKey(), e.getValue()));
 
         //initiate pushes to all the active outgoingSubscriptions
         //would be nice if we could do this in a random order
