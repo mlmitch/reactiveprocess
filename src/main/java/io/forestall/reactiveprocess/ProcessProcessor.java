@@ -1,104 +1,196 @@
 package io.forestall.reactiveprocess;
 
-import io.forestall.reactiveprocess.internals.ProcessSubscriber;
-import io.forestall.reactiveprocess.internals.ProcessSubscription;
-
 import java.io.*;
 import java.util.Optional;
 import java.util.concurrent.*;
 
-public class ProcessProcessor<T>
-        implements Flow.Processor<ProcessInput<T>, ProcessOutput<T>> {
+import static java.lang.Long.max;
 
-    private final ProcessSubscriber<T> processSubscriber;
-    private final ConcurrentHashMap<Flow.Subscriber<? super ProcessOutput<T>>, ProcessSubscription<T>> subscriptions;
+public class ProcessProcessor<T> implements Flow.Processor<ProcessInput<T>, ProcessOutput<T>> {
 
-    private final ProcessBuilder processBuilder;
-    private final int maxProcesses;
-    private int runningProcesses;
-
-    private final ConcurrentLinkedQueue<ProcessOutput<T>> output;
-    private long outputSize;
-    private final long maxOutputSize;
+    private final ProcessProcessorConfig config;
 
     //single thread executor for bookeeping
     private final ExecutorService executor;
 
-    private final long processTimeoutMillis;
+    private boolean destroyed;
 
+    private Flow.Subscription incomingSubscription;
+    private final ConcurrentLinkedQueue<ProcessInput<T>> input;
+    //keep our own input size as ConcurrentLinkedQueue::size is O(n) and not accurate
+    private long inputSize;
+    private long outstandingRequests;
+
+    private int runningProcesses;
     private final ExecutorService streamCopier;
 
-    public ProcessProcessor(ProcessBuilder processBuilder, int maxProcesses, long maxRequests, long processTimeoutMillis) {
-        if (maxProcesses <= 0) {
-            throw new IllegalArgumentException("Maximum number of processes must be greater than 0");
-        }
+    private final ConcurrentLinkedQueue<ProcessOutput<T>> output;
+    private long outputSize;
 
-        if (null == processBuilder) {
-            throw new IllegalArgumentException("Null ProcessBuilder not allowed");
-        }
+    private final ConcurrentHashMap<Flow.Subscriber<? super ProcessOutput<T>>, ProcessSubscription<T>> outgoingSubscriptions;
 
-        this.processBuilder = processBuilder;
-        this.maxProcesses = maxProcesses;
-
+    public ProcessProcessor(ProcessProcessorConfig config) {
+        this.config = config;
         executor = Executors.newSingleThreadExecutor();
+        destroyed = false;
 
-        processSubscriber = new ProcessSubscriber<>(maxRequests, executor, this::pull);
+        this.incomingSubscription = null;
+        input = new ConcurrentLinkedQueue<>();
+        inputSize = 0;
+        outstandingRequests = 0;
 
+        streamCopier = Executors.newWorkStealingPool(this.config.getProcessLimit());
         runningProcesses = 0;
-        this.processTimeoutMillis = processTimeoutMillis;
-
-        subscriptions = new ConcurrentHashMap<>();
 
         output = new ConcurrentLinkedQueue<>();
         outputSize = 0;
-        maxOutputSize = maxRequests;
 
-        streamCopier = Executors.newWorkStealingPool(maxProcesses);
+        outgoingSubscriptions = new ConcurrentHashMap<>();
     }
 
-    private void push() {
-        //initiate pushes to all the subscriptions
-        //would be nice if we could do this in a random order
-        subscriptions.values().forEach(ProcessSubscription::push);
+    @Override
+    public void onNext(ProcessInput<T> item) {
+        if (null == item) {
+            throw new NullPointerException("Null InputStreams not allowed.");
+        }
+
+        //always true for this type of queue
+        input.add(item);
+
+        //book keeping
+        executor.submit(() -> {
+            outstandingRequests--;
+            inputSize++;
+            pullToSubscriber();
+
+            //something has become available
+            pullToProcess();
+        });
     }
 
-    public void destroy() {
-        //cancels incoming subscription
-        //and signals oncomplete
-        processSubscriber.destroy();
-        subscriptions.values().forEach(ProcessSubscription::pushComplete);
+    @Override
+    public void onSubscribe(Flow.Subscription subscription) {
+        if (null == subscription) {
+            throw new NullPointerException("Null Subscriptions not allowed.");
+        }
+
+        executor.submit(() -> {
+            if (null == this.incomingSubscription && !destroyed) {
+                this.incomingSubscription = subscription;
+                outstandingRequests = 0;
+                pullToSubscriber();
+            } else {
+                subscription.cancel();
+            }
+        });
     }
 
-    private void destroy(Throwable throwable) {
-        //cancels incoming subscription
-        //and pushes out the error
-        processSubscriber.destroy();
-        subscriptions.values().forEach(s -> s.pushError(throwable));
+    @Override
+    public void onError(Throwable throwable) {
+        if (null == throwable) {
+            throw new NullPointerException("Null Throwables not allowed.");
+        }
+
+        //TODO: consider propagating the error... doesn't seem to be a good reason to
+
+        //Outstanding requests will be reset when
+        //another subscriber is provided
+        //This needs to be submitted or incomingSubscription would need to be volatile
+        executor.submit(() -> {
+            //if (null != incomingSubscription)
+            incomingSubscription = null;
+        });
     }
 
-    private void pull() {
-        //called by the subscriber on the executor
+    @Override
+    public void onComplete() {
+        //Outstanding requests will be reset when
+        //another subscriber is provided
+        executor.submit(() -> {
+            //if (null != incomingSubscription)
+            incomingSubscription = null;
+        });
+    }
 
+    @Override
+    public void subscribe(Flow.Subscriber<? super ProcessOutput<T>> subscriber) {
+        if (null == subscriber) {
+            throw new NullPointerException("Null subscribers not allowed");
+        }
+
+        //if we already have this subscriber then just don't create another incomingSubscription
+        //goes against spec to create another
+        //not mandated to notify the subscriber
+        outgoingSubscriptions.computeIfAbsent(subscriber, s -> {
+            ProcessSubscription<T> subscription = new ProcessSubscription<>(s, executor, this::supplyFromProducer);
+            s.onSubscribe(subscription);
+            return subscription;
+        });
+    }
+
+    public void subscriberUnsubscribe() {
+        executor.submit(() -> {
+            if (null != incomingSubscription) {
+                incomingSubscription.cancel();
+                incomingSubscription = null;
+            }
+        });
+    }
+
+    //only call from within executor
+    private void pullToSubscriber() {
+        //don't strictly enforce input size
+        //just make sure the queue is being consumed.
+        if (outstandingRequests + inputSize < config.getInputQueueLimit() && null != incomingSubscription) {
+            //if outstandingRequests goes negative due to previous
+            //publishers, we recover here
+            outstandingRequests = config.getInputQueueLimit() - inputSize;
+            long desired = config.getInputQueueLimit() - inputSize - max(0, outstandingRequests);
+            if (desired > 0) {
+                incomingSubscription.request(desired);
+            }
+        }
+    }
+
+    //only call from within executor
+    private Optional<ProcessInput<T>> supplyFromSubscriber() {
+        Optional<ProcessInput<T>> result = Optional.ofNullable(input.poll());
+
+        if (result.isPresent()) {
+            //successfully got an element
+            inputSize--;
+            pullToSubscriber();
+        }
+
+        return result;
+    }
+
+    //only call within executor
+    private void pullToProcess() {
         //check if we want to make another process
         //max processes executing already
         //result queue can take more
-        if (runningProcesses < maxProcesses && outputSize < maxOutputSize) {
-            Optional<ProcessInput<T>> input = processSubscriber.supply();
-            input.ifPresent(this::launchProcess);
+        if (runningProcesses < config.getProcessLimit() && outputSize < config.getOutputQueueLimit()) {
+            Optional<ProcessOutput<T>> processOutput = supplyFromSubscriber().flatMap(this::process);
+            if (processOutput.isPresent()) {
+                output.add(processOutput.get());
+                outputSize++;
+                pushToSubscriptions();
+            }
         }
 
     }
 
-    //only call within processExecutor
-    private void launchProcess(ProcessInput<T> processInput) {
+    //only call within executor
+    private Optional<ProcessOutput<T>> process(ProcessInput<T> processInput) {
         Process process;
 
         try {
-            process = processBuilder.start();
+            process = config.getProcessBuilder().start();
         } catch (IOException e) {
             //if we can't launch processes then what are we doing
-            destroy(e);
-            return;
+            //destroy(e);
+            return Optional.empty();
         }
 
         runningProcesses++;
@@ -129,18 +221,9 @@ public class ProcessProcessor<T>
             }
         });
 
-        ProcessOutput<T> processOutput =
-                new ProcessOutput<>(process.toHandle(),
-                        new BufferedInputStream(process.getInputStream()),
-                        new BufferedInputStream(process.getErrorStream()),
-                        processInput.getTag());
-
-        output.add(processOutput);
-        outputSize++;
-
         process.toHandle()
                 .onExit()
-                .orTimeout(processTimeoutMillis, TimeUnit.MILLISECONDS)
+                .orTimeout(config.getProcessTimeout(), TimeUnit.MILLISECONDS)
                 .whenCompleteAsync((p, t) -> {
                     if (p.isAlive()) {
                         //this means we timed out
@@ -156,66 +239,41 @@ public class ProcessProcessor<T>
                 }, executor);
 
         //TODO: set up actions to take when the process completes
+        ProcessOutput<T> processOutput =
+                new ProcessOutput<>(process.toHandle(),
+                        new BufferedInputStream(process.getInputStream()),
+                        new BufferedInputStream(process.getErrorStream()),
+                        processInput.getTag());
+        return Optional.of(processOutput);
     }
 
-    //called from inside subscriptions.
+    //only call within executor
+    private void pushToSubscriptions() {
+        //remove the inactive subscriptions
+        outgoingSubscriptions.values().stream()
+                .filter(s -> !s.isActive())
+                .map(ProcessSubscription::getSubscriber)
+                .forEach(outgoingSubscriptions::remove);
+
+        //initiate pushes to all the active outgoingSubscriptions
+        //would be nice if we could do this in a random order
+        outgoingSubscriptions.values().stream()
+                .filter(ProcessSubscription::isActive)
+                .forEach(ProcessSubscription::pushToSubscription);
+    }
+
+    //only call from within executor
+    //called from inside outgoingSubscriptions.
     //initiates a pull as we might need more outputs
-    private Optional<ProcessOutput<T>> supply() {
+    private Optional<ProcessOutput<T>> supplyFromProducer() {
         Optional<ProcessOutput<T>> result = Optional.ofNullable(output.poll());
 
         if (result.isPresent()) {
             //successfully got an element
-            executor.submit(() -> {
-                outputSize--;
-                pull();
-            });
+            outputSize--;
+            pullToProcess();
         }
 
         return result;
-    }
-
-    ////////////////////////////////////////////////////////////////////////////////////////
-    //Producer method
-    ////////////////////////////////////////////////////////////////////////////////////////
-
-    @Override
-    public void subscribe(Flow.Subscriber<? super ProcessOutput<T>> subscriber) {
-        if (null == subscriber) {
-            throw new NullPointerException("Null subscribers not allowed");
-        }
-
-        //if we already have this subscriber then just don't create another subscription
-        //goes against spec to create another
-        //not mandated to notify the subscriber
-        subscriptions.computeIfAbsent(subscriber, s -> {
-            ProcessSubscription<T> subscription = new ProcessSubscription<>(s, executor, this::supply);
-            s.onSubscribe(subscription);
-            return subscription;
-        });
-    }
-
-
-    ////////////////////////////////////////////////////////////////////////////////////////
-    //Subscriber methods
-    ////////////////////////////////////////////////////////////////////////////////////////
-
-    @Override
-    public void onSubscribe(Flow.Subscription subscription) {
-        processSubscriber.onSubscribe(subscription);
-    }
-
-    @Override
-    public void onNext(ProcessInput<T> item) {
-        processSubscriber.onNext(item);
-    }
-
-    @Override
-    public void onError(Throwable throwable) {
-        processSubscriber.onError(throwable);
-    }
-
-    @Override
-    public void onComplete() {
-        processSubscriber.onComplete();
     }
 }
